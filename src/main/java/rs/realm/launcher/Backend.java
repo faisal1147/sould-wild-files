@@ -1,0 +1,372 @@
+package rs.realm.launcher;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Everything the launcher asks the RS-Realm backend.
+ *
+ * One class, because every call shares the same three concerns: the base URL, the bearer token, and
+ * turning a non-2xx reply into a message a player can act on. The server sends {@code {"error": …}}
+ * on failure, so {@link #send} surfaces that text rather than a status code — "that name is taken"
+ * beats "HTTP 409".
+ */
+public final class Backend {
+
+    /** A profile the player can play as. */
+    public record Profile(int accountId, String loginUsername, String displayName) {
+        @Override
+        public String toString() {
+            return displayName;
+        }
+    }
+
+    /** Who the launcher is signed in as. */
+    public record Account(String discordId, String username, String avatarUrl) {}
+
+    /** One post from the announcements channel. */
+    public record News(
+            String title, String body, String timestamp, String imageUrl, String author) {}
+
+    /** What the backend says about starting a Discord login. */
+    public record OAuthConfig(String clientId, String redirectUri, boolean enabled) {}
+
+    /** One character under a Discord account, for the admin list. */
+    public record AdminProfile(String name, String lastLogin) {
+
+        /** Signed up but never actually played. */
+        public boolean neverPlayed() {
+            return lastLogin == null || lastLogin.isBlank();
+        }
+    }
+
+    /** One Discord account that has linked at least one character. */
+    public record AdminUser(
+            String discordId, String username, String linkedAt, List<AdminProfile> profiles) {}
+
+    /** One player currently in the game world. */
+    public record OnlinePlayer(String name, int x, int z, int level, int donatedCents) {
+
+        /** The rank label, derived here so the launcher does not need the thresholds twice. */
+        public String rank() {
+            if (donatedCents >= 50_000) return "Rich kid";
+            if (donatedCents >= 10_000) return "Extreme";
+            if (donatedCents >= 2_500) return "Super";
+            return donatedCents >= 1 ? "Donator" : "";
+        }
+    }
+
+    /** The admin overview. Only ever returned to a Discord id the server considers an admin. */
+    public record AdminOverview(
+            int discordUsers,
+            int profiles,
+            int profilesPlayed,
+            int profilesNeverPlayed,
+            List<AdminUser> users) {}
+
+    private final HttpClient http =
+            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+
+    private final String baseUrl;
+    private String session;
+
+    public Backend(String baseUrl) {
+        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+    }
+
+    /** Sets the bearer token used for every {@code /auth/} call. Null signs out locally. */
+    public void setSession(String session) {
+        this.session = session;
+    }
+
+    public boolean hasSession() {
+        return session != null && !session.isBlank();
+    }
+
+    /** The current bearer token, so the caller can persist it. Null when signed out. */
+    public String session() {
+        return session;
+    }
+
+    // ------------------------------------------------------------------- public API ----
+
+    public OAuthConfig oauthConfig() throws IOException {
+        Map<String, Object> body = send("GET", "/launcher/config", null);
+        return new OAuthConfig(
+                Json.str(body, "discord_client_id", ""),
+                Json.str(body, "redirect_uri", ""),
+                Json.bool(body, "oauth_enabled", false));
+    }
+
+    /** How many players are online right now. */
+    public int onlinePlayers() throws IOException {
+        return Json.number(send("GET", "/launcher/status", null), "players", 0);
+    }
+
+    public List<News> news() throws IOException {
+        Map<String, Object> body = send("GET", "/launcher/news", null);
+        List<News> out = new ArrayList<>();
+        for (Map<String, Object> item : Json.objects(body, "news")) {
+            out.add(
+                    new News(
+                            Json.str(item, "title", ""),
+                            Json.str(item, "body", ""),
+                            Json.str(item, "timestamp", ""),
+                            Json.str(item, "image_url", null),
+                            Json.str(item, "author", "")));
+        }
+        return out;
+    }
+
+    /** Trades a completed Discord round-trip for a launcher session, and remembers it. */
+    public Account signIn(DiscordLogin.Result login) throws IOException {
+        Map<String, String> request = new LinkedHashMap<>();
+        request.put("code", login.code());
+        request.put("redirect_uri", login.redirectUri());
+        request.put("code_verifier", login.codeVerifier());
+
+        Map<String, Object> body = send("POST", "/auth/discord/exchange", Json.write(request));
+        session = Json.str(body, "session", null);
+        if (session == null) {
+            throw new IOException("The server did not return a session.");
+        }
+        return account(Json.object(body, "discord"));
+    }
+
+    public List<Profile> profiles() throws IOException {
+        Map<String, Object> body = send("GET", "/auth/profiles", null);
+        return profilesOf(body);
+    }
+
+    /** Profiles plus the signed-in account, in one call — what the window needs on open. */
+    public Map.Entry<Account, List<Profile>> profilesAndAccount() throws IOException {
+        Map<String, Object> body = send("GET", "/auth/profiles", null);
+        return Map.entry(account(Json.object(body, "discord")), profilesOf(body));
+    }
+
+    public Profile createProfile(String displayName) throws IOException {
+        Map<String, Object> body =
+                send("POST", "/auth/profiles", Json.write(Map.of("display_name", displayName)));
+        return new Profile(
+                Json.number(body, "account_id", 0),
+                Json.str(body, "login_username", ""),
+                Json.str(body, "display_name", displayName));
+    }
+
+    /**
+     * Takes a profile off this Discord account's list.
+     *
+     * Unlinks rather than deletes — the character and everything on it stay, but nothing points at
+     * it any more.
+     */
+    public void unlinkProfile(Profile profile) throws IOException {
+        send(
+                "POST",
+                "/auth/profiles/unlink",
+                Json.write(Map.of("login_username", profile.loginUsername())));
+    }
+
+    /** Mints the one-shot token that authenticates the client. */
+    public String launchToken(Profile profile) throws IOException {
+        Map<String, Object> body =
+                send(
+                        "POST",
+                        "/auth/launch-token",
+                        Json.write(Map.of("login_username", profile.loginUsername())));
+        String token = Json.str(body, "token", null);
+        if (token == null) {
+            throw new IOException("The server did not return a launch token.");
+        }
+        return token;
+    }
+
+    /**
+     * A short code the player types in game as {@code ::discord <code>} to adopt an existing
+     * character.
+     *
+     * No account is named: this end only says "whoever types this is me". Which character it
+     * attaches to is decided by whichever one is logged in when the code is spent.
+     */
+    public String linkCode() throws IOException {
+        Map<String, Object> body = send("POST", "/auth/link-code", "{}");
+        String code = Json.str(body, "code", null);
+        if (code == null) {
+            throw new IOException("The server did not return a code.");
+        }
+        return code;
+    }
+
+    public void signOut() {
+        if (hasSession()) {
+            // Best effort. A failure here only means the server keeps a row that will expire anyway;
+            // what matters to the player is that this machine forgets the token, which we do next.
+            try {
+                send("POST", "/auth/logout", "{}");
+            } catch (IOException ignored) {
+                // Nothing useful to say — we are signing out either way.
+            }
+        }
+        session = null;
+    }
+
+    // --------------------------------------------------------------------- plumbing ----
+
+    private Account account(Map<String, Object> discord) {
+        return new Account(
+                Json.str(discord, "id", ""),
+                Json.str(discord, "username", "Player"),
+                Json.str(discord, "avatar_url", null));
+    }
+
+    private List<Profile> profilesOf(Map<String, Object> body) {
+        List<Profile> out = new ArrayList<>();
+        for (Map<String, Object> item : Json.objects(body, "profiles")) {
+            out.add(
+                    new Profile(
+                            Json.number(item, "account_id", 0),
+                            Json.str(item, "login_username", ""),
+                            Json.str(item, "display_name", "")));
+        }
+        return out;
+    }
+
+    /**
+     * The admin overview, or {@code null} when this account is not an admin.
+     *
+     * The server decides that, not the launcher: a 403 here is the answer, and the caller uses it to
+     * leave the Admin tab off the window. Hiding the tab is cosmetic — the list itself is protected
+     * on the other end, so a modified launcher gains nothing by showing the tab anyway.
+     */
+    public AdminOverview adminOverview() throws IOException {
+        Map<String, Object> body;
+        try {
+            // Under /auth/ because that is a prefix the reverse proxy actually forwards; an
+            // /admin/ path 404s before it ever reaches the game server.
+            body = send("GET", "/auth/admin/overview", null);
+        } catch (NotAllowedException e) {
+            return null;
+        }
+
+        List<AdminUser> users = new ArrayList<>();
+        for (Map<String, Object> user : Json.objects(body, "users")) {
+            List<AdminProfile> profiles = new ArrayList<>();
+            for (Map<String, Object> profile : Json.objects(user, "profiles")) {
+                profiles.add(
+                        new AdminProfile(
+                                Json.str(profile, "name", ""), Json.str(profile, "last_login", "")));
+            }
+            users.add(
+                    new AdminUser(
+                            Json.str(user, "discord_id", ""),
+                            Json.str(user, "discord_username", ""),
+                            Json.str(user, "linked_at", ""),
+                            profiles));
+        }
+
+        return new AdminOverview(
+                Json.number(body, "discord_users", 0),
+                Json.number(body, "profiles", 0),
+                Json.number(body, "profiles_played", 0),
+                Json.number(body, "profiles_never_played", 0),
+                users);
+    }
+
+    /** Everyone currently online. Empty when the caller is not an admin. */
+    public List<OnlinePlayer> adminOnlinePlayers() throws IOException {
+        Map<String, Object> body;
+        try {
+            body = send("GET", "/auth/admin/players", null);
+        } catch (NotAllowedException e) {
+            return List.of();
+        }
+        List<OnlinePlayer> out = new ArrayList<>();
+        for (Map<String, Object> item : Json.objects(body, "players")) {
+            out.add(
+                    new OnlinePlayer(
+                            Json.str(item, "name", ""),
+                            Json.number(item, "x", 0),
+                            Json.number(item, "z", 0),
+                            Json.number(item, "level", 0),
+                            Json.number(item, "donated_cents", 0)));
+        }
+        return out;
+    }
+
+    /**
+     * Queue an action against the live world.
+     *
+     * The server answers "queued", not "done" — it applies the action on the game loop a tick later,
+     * so a success here means it was accepted, not that it landed. The caller's wording should
+     * match.
+     */
+    public void adminAction(Map<String, String> fields) throws IOException {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> entry : fields.entrySet()) {
+            if (!first) {
+                json.append(',');
+            }
+            first = false;
+            json.append('"').append(entry.getKey()).append("\":\"").append(escapeJson(entry.getValue())).append('"');
+        }
+        json.append('}');
+        send("POST", "/auth/admin/action", json.toString());
+    }
+
+    /** Minimal escaping — these values are admin-typed text, but a stray quote must not break the body. */
+    private static String escapeJson(String value) {
+        return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ");
+    }
+
+    /** A 403. Separate from a plain failure so a caller can treat "not you" as a normal answer. */
+    public static final class NotAllowedException extends IOException {
+        NotAllowedException(String message) {
+            super(message);
+        }
+    }
+
+    private Map<String, Object> send(String method, String path, String body) throws IOException {
+        HttpRequest.Builder builder =
+                HttpRequest.newBuilder(URI.create(baseUrl + path)).timeout(Duration.ofSeconds(15));
+        if (body == null) {
+            builder.GET();
+        } else {
+            builder.header("Content-Type", "application/json");
+            builder.POST(HttpRequest.BodyPublishers.ofString(body));
+        }
+        if (hasSession()) {
+            builder.header("Authorization", "Bearer " + session);
+        }
+
+        HttpResponse<String> response;
+        try {
+            response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted talking to the server.", e);
+        }
+
+        Map<String, Object> parsed = Json.parseObject(response.body());
+        int status = response.statusCode();
+        if (status >= 200 && status < 300) {
+            return parsed;
+        }
+        if (status == 403) {
+            throw new NotAllowedException(Json.str(parsed, "error", "not allowed"));
+        }
+        if (status == 401) {
+            // The session expired or was revoked. Drop it so the window falls back to the sign-in
+            // screen instead of retrying a token that will never work again.
+            session = null;
+        }
+        throw new IOException(Json.str(parsed, "error", "The server returned " + status + "."));
+    }
+}

@@ -1,0 +1,218 @@
+# Builds every downloadable form of the launcher and attaches them to a GitHub release.
+#
+# jpackage cannot cross-compile, so each native bundle is built on its own operating system. That is
+# the whole reason this file exists: a macOS .dmg cannot be produced on the Windows machine where
+# this repo is edited.
+#
+# The macOS bundle is Apple Silicon only. A bundle carries one architecture's runtime, so an Intel
+# Mac would need its own build on a macos-13 runner — and GitHub is retiring those, so that job sat
+# queued indefinitely and held up every release behind it. Intel Mac players use the portable jar.
+#
+# Trigger by pushing a tag:  git tag launcher-v1.0.0 && git push origin launcher-v1.0.0
+name: Release launcher
+
+on:
+  push:
+    tags:
+      - "launcher-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Launcher version, e.g. 1.0.0"
+        required: true
+        default: "1.0.0"
+      publish:
+        description: "Also create the GitHub release (otherwise it only builds)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not throw away the bundles that did build — a Mac-only problem
+      # should still leave a downloadable Windows installer.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows installer
+            task: nativeInstaller
+            suffix: windows
+            glob: build/jpackage/installer/*.exe
+          - os: macos-14
+            label: macOS installer (Apple Silicon)
+            task: nativeInstaller
+            suffix: macos-arm64
+            glob: build/jpackage/installer/*.dmg
+          # No Intel Mac bundle. GitHub is retiring the macos-13 runners, so the job sat queued
+          # indefinitely and blocked every release behind it — the publish step waits on all four.
+          # Intel Mac players use the portable jar, which needs a system Java 21.
+          - os: ubuntu-latest
+            label: Portable jar
+            task: jar
+            suffix: portable
+            # Named exactly, not *.jar: the packaging tasks also produce the bootstrap jar, and two
+            # matches here would silently overwrite each other under one name.
+            glob: build/libs/rs-realm-launcher.jar
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out the version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#launcher-v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # jpackage shells out to WiX to build a Windows .exe installer. The runner image already ships
+      # a WiX 3, so this only has to install one when that stops being true — and it must not pin a
+      # version, because choco fails outright rather than shrugging when asked to downgrade.
+      - name: Ensure WiX is available (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $candle = Get-Command candle.exe -ErrorAction SilentlyContinue
+          if ($candle) {
+            Write-Host "WiX already present: $($candle.Source)"
+          } else {
+            choco install wixtoolset -y --no-progress
+            Get-ChildItem "C:\Program Files (x86)" -Filter "WiX Toolset v*" -Directory |
+              ForEach-Object { "$($_.FullName)\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8 }
+          }
+
+      # The exec bit does not survive a checkout on every setup, and the file is easy to reintroduce
+      # from a Windows machine without it. One chmod is cheaper than rediscovering this failure.
+      - name: Make the Gradle wrapper executable
+        if: runner.os != 'Windows'
+        run: chmod +x gradlew
+
+      - name: Build
+        shell: bash
+        run: ./gradlew ${{ matrix.task }} -PlauncherVersion=${{ steps.version.outputs.value }} --no-daemon
+
+      # Collected into one directory under a name that says which platform it is for, and that says
+      # Launcher. The client ships as a .jar too, and "RS-Realm-1.0.0-portable.jar" next to
+      # "fiddled-client.jar" is one confused download away from a support question.
+      - name: Collect the bundle
+        shell: bash
+        run: |
+          set -eu
+          shopt -s nullglob
+          mkdir -p dist
+          found=0
+          for f in ${{ matrix.glob }}; do
+            cp "$f" "dist/Soul-Wild-Launcher-${{ steps.version.outputs.value }}-${{ matrix.suffix }}.${f##*.}"
+            found=$((found + 1))
+          done
+          # Fail here rather than at upload: this way the error names the glob that matched nothing.
+          if [ "$found" -eq 0 ]; then
+            echo "No build output matched ${{ matrix.glob }}" >&2
+            exit 1
+          fi
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # A tag publishes. A manual run only builds, unless it explicitly asks to publish — the escape
+    # hatch for when a tag push does not reach Actions, which has happened.
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: bundles
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          # On a tag the ref names the release; on a manual publish it is "main", so the version
+          # input has to supply the name instead.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="launcher-v$VERSION"
+          fi
+          files=$(find bundles -type f | tr '\n' ' ')
+          echo "Publishing $tag with: $files"
+          # Idempotent on purpose. A release may already exist because a slow runner meant the
+          # first bundles were published by hand and this run is only adding the rest; creating
+          # would fail outright there, and failing after a successful build helps nobody.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag exists; uploading into it."
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber $files
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Soul Wild Launcher ${tag#launcher-v}" \
+              --generate-notes \
+              $files
+          fi
+
+      # Installed launchers read this file on every start and update themselves from it, so a
+      # release that does not update it reaches nobody who already has the launcher. Done here,
+      # AFTER the assets are uploaded: a manifest that points at a download which does not exist yet
+      # breaks every launcher that opens during the gap.
+      - name: Point installed launchers at this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="launcher-v$VERSION"
+          fi
+          version="${tag#launcher-v}"
+          jar=$(find bundles -type f -name '*-portable.jar' | head -n1)
+          if [ -z "$jar" ]; then
+            echo "No portable jar was built; leaving launcher.properties alone." >&2
+            exit 0
+          fi
+          sha=$(sha256sum "$jar" | cut -d' ' -f1)
+          name=$(basename "$jar")
+          cat > launcher.properties <<EOF
+          # Read by rs.realm.launcher.Bootstrap in every installed launcher. Written by the release
+          # workflow — edit the release, not this file.
+          version=$version
+          url=https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/$name
+          sha256=$sha
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add launcher.properties
+          if git diff --cached --quiet; then
+            echo "launcher.properties already current."
+          else
+            git commit -m "Launcher $version is live"
+            git push origin main
+          fi
