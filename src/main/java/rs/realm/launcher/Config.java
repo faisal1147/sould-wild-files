@@ -29,7 +29,7 @@ public final class Config {
             "https://raw.githubusercontent.com/faisal1147/sould-wild-files/main/version.properties");
 
     /** Where the client jar + install metadata live (per-user). */
-    public static final Path INSTALL_DIR = Path.of(System.getProperty("user.home"), ".rs-realm");
+    public static final Path INSTALL_DIR = Path.of(System.getProperty("user.home"), ".soul-wild");
 
     /** The downloaded, runnable client (the Fiddled fat jar). */
     public static final Path CLIENT_JAR = INSTALL_DIR.resolve("fiddled-client.jar");

@@ -24,7 +24,7 @@ import java.util.jar.JarFile;
  * <p>Replacing the bundled jar in place is not an option even though the install is per-user and
  * writable. The JVM holds it open for as long as the launcher runs, Windows will not let an open
  * file be replaced, and it is already open before any of our code runs. So the jar that actually
- * runs the UI lives in {@code ~/.rs-realm/launcher/} instead, where nothing has it open at the
+ * runs the UI lives in {@code ~/.soul-wild/launcher/} instead, where nothing has it open at the
  * moment we want to write it.
  *
  * <h2>Deliberately self-contained</h2>
@@ -54,7 +54,7 @@ public final class Bootstrap {
             "rsrealm.launchermanifest",
             "https://raw.githubusercontent.com/faisal1147/sould-wild-files/main/launcher.properties");
 
-    private static final Path HOME = Path.of(System.getProperty("user.home"), ".rs-realm", "launcher");
+    private static final Path HOME = Path.of(System.getProperty("user.home"), ".soul-wild", "launcher");
     private static final Path DOWNLOADED_JAR = HOME.resolve("rs-realm-launcher.jar");
     private static final Path DOWNLOADED_META = HOME.resolve("installed.properties");
 
